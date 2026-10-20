@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#f6f4ef">
+<title>Árbol genealógico Pezuk</title>
+<style>
+  :root { color-scheme: light; --ink:#292923; --muted:#706f68; --paper:#f6f4ef; --panel:#fffefa; --line:#dedbd2; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; overflow:hidden; font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--paper); }
+  .app { height:100%; display:flex; flex-direction:column; }
+  header { z-index:5; display:flex; align-items:center; gap:12px; padding:10px 14px; background:var(--panel); border-bottom:1px solid var(--line); box-shadow:0 2px 12px #2420180b; }
+  .brand { min-width:0; flex:1; }
+  h1 { font-size:16px; line-height:1.2; margin:0; font-weight:750; letter-spacing:.01em; }
+  .sub { color:var(--muted); font-size:12px; margin-top:3px; }
+  .tools { display:flex; align-items:center; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+  button { font:inherit; border:1px solid var(--line); background:white; color:var(--ink); border-radius:9px; min-height:36px; padding:7px 11px; cursor:pointer; }
+  button:hover { background:#f0eee7; }
+  button:focus-visible { outline:3px solid #a5b9e8; outline-offset:2px; }
+  #zoomLabel { min-width:54px; text-align:center; font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  #stage { position:relative; flex:1; min-height:0; overflow:hidden; cursor:grab; touch-action:none; background-color:#eae8e1; background-image:radial-gradient(#c9c6bc 0.7px,transparent .7px); background-size:18px 18px; }
+  #stage.dragging { cursor:grabbing; }
+  #sheet { position:absolute; left:0; top:0; transform-origin:0 0; background:white; box-shadow:0 8px 30px #1e1c1730; }
+  #pdfCanvas { display:block; width:100%; height:100%; }
+  #loading { position:absolute; inset:0; display:flex; flex-direction:column; justify-content:center; align-items:center; gap:12px; color:var(--muted); padding:24px; text-align:center; }
+  .spinner { width:28px; height:28px; border:3px solid #d7d3c9; border-top-color:#55554b; border-radius:50%; animation:spin .8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  #error { display:none; max-width:580px; line-height:1.5; background:white; border:1px solid var(--line); border-radius:12px; padding:18px; }
+  footer { padding:7px 12px; text-align:center; font-size:11px; color:var(--muted); background:var(--panel); border-top:1px solid var(--line); }
+  @media (max-width:650px) {
+    header { align-items:flex-start; padding:9px; gap:8px; }
+    h1 { font-size:14px; }
+    .sub { font-size:11px; }
+    .tools { max-width:54%; gap:4px; }
+    button { min-height:34px; padding:6px 9px; font-size:13px; }
+    #zoomLabel { min-width:43px; }
+    footer { font-size:10px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">
+      <h1>Árbol genealógico Pezuk</h1>
+      <div class="sub">Explorá el árbol · ampliá · arrastrá para desplazarte</div>
+    </div>
+    <div class="tools" aria-label="Controles del visor">
+      <button id="minus" title="Alejar" aria-label="Alejar">−</button>
+      <span id="zoomLabel">100%</span>
+      <button id="plus" title="Acercar" aria-label="Acercar">+</button>
+      <button id="fit" title="Ver hoja completa">Ajustar</button>
+      <button id="reset" title="Volver a la vista inicial">Inicio</button>
+      <button id="download" title="Descargar el PDF original">PDF ↓</button>
+    </div>
+  </header>
+  <main id="stage" aria-label="Visor del árbol genealógico">
+    <div id="sheet"><canvas id="pdfCanvas"></canvas></div>
+    <div id="loading"><div class="spinner"></div><div>Cargando el árbol genealógico…</div></div>
+    <div id="error"><strong>No se pudo cargar el PDF.</strong><br><span id="errorText"></span><br><br>Si abriste index.html directamente desde tu ordenador, iniciá el visor desde un servidor web local o publicá la carpeta completa en un alojamiento web.</div>
+  </main>
+  <footer>Usá la rueda del ratón para ampliar · Arrastrá para moverte · En móvil, pellizcá para ampliar y deslizá con un dedo</footer>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+(() => {
+  const PDF_URL = "./assets/arbol-pezuk.pdf";
+  const stage = document.getElementById("stage");
+  const sheet = document.getElementById("sheet");
+  const canvas = document.getElementById("pdfCanvas");
+  const ctx = canvas.getContext("2d", { alpha: false });
+  const label = document.getElementById("zoomLabel");
+  const loading = document.getElementById("loading");
+  const errorBox = document.getElementById("error");
+  let pdfPage, baseWidth = 0, baseHeight = 0, zoom = 1, x = 0, y = 0;
+  let renderTask = null, renderToken = 0, startFit = 1, lastPinchDistance = 0, pointers = new Map();
+  const MIN_ZOOM = 0.08, MAX_ZOOM = 8;
+
+  if (!window.pdfjsLib) {
+    showError("No se pudo cargar el motor del visor (PDF.js). Comprobá la conexión a internet y recargá la página.");
+    return;
+  }
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+  function showError(msg) {
+    loading.style.display = "none";
+    errorBox.style.display = "block";
+    document.getElementById("errorText").textContent = msg;
+  }
+  function updateView() {
+    sheet.style.transform = `translate(${x}px, ${y}px) scale(${zoom})`;
+    label.textContent = `${Math.round(zoom * 100)}%`;
+  }
+  function clampZoom(z) { return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z)); }
+  function zoomAt(newZoom, px, py) {
+    newZoom = clampZoom(newZoom);
+    const ratio = newZoom / zoom;
+    x = px - (px - x) * ratio;
+    y = py - (py - y) * ratio;
+    zoom = newZoom;
+    updateView();
+  }
+  function centerSheet() {
+    x = (stage.clientWidth - baseWidth * zoom) / 2;
+    y = (stage.clientHeight - baseHeight * zoom) / 2;
+    updateView();
+  }
+  function fitSheet() {
+    if (!baseWidth || !baseHeight) return;
+    startFit = Math.min(stage.clientWidth / baseWidth, stage.clientHeight / baseHeight);
+    zoom = clampZoom(startFit);
+    centerSheet();
+  }
+  function renderAtCurrentZoom() {
+    if (!pdfPage) return;
+    const token = ++renderToken;
+    if (renderTask) { try { renderTask.cancel(); } catch (_) {} }
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    const viewport = pdfPage.getViewport({ scale: zoom });
+    const renderViewport = pdfPage.getViewport({ scale: zoom * dpr });
+    const w = Math.ceil(renderViewport.width), h = Math.ceil(renderViewport.height);
+    // Guard against browser canvas limits at extreme zoom. The visual sheet still zooms freely.
+    const maxPixels = 42_000_000;
+    let factor = 1;
+    if (w * h > maxPixels) factor = Math.sqrt(maxPixels / (w * h));
+    canvas.width = Math.max(1, Math.floor(w * factor));
+    canvas.height = Math.max(1, Math.floor(h * factor));
+    canvas.style.width = viewport.width + "px";
+    canvas.style.height = viewport.height + "px";
+    sheet.style.width = viewport.width + "px";
+    sheet.style.height = viewport.height + "px";
+    const actualScale = zoom * dpr * factor;
+    const renderViewportAdjusted = pdfPage.getViewport({ scale: actualScale });
+    renderTask = pdfPage.render({ canvasContext: ctx, viewport: renderViewportAdjusted });
+    renderTask.promise.then(() => {
+      if (token !== renderToken) return;
+      // Preserve CSS dimensions while allowing the sheet to be positioned/zoomed independently.
+      canvas.style.width = viewport.width + "px";
+      canvas.style.height = viewport.height + "px";
+    }).catch(err => {
+      if (err && err.name !== "RenderingCancelledException") console.error(err);
+    });
+  }
+  function changeZoom(z, px = stage.clientWidth/2, py = stage.clientHeight/2) {
+    zoomAt(z, px, py);
+    renderAtCurrentZoom();
+  }
+  document.getElementById("plus").addEventListener("click", () => changeZoom(zoom * 1.35));
+  document.getElementById("minus").addEventListener("click", () => changeZoom(zoom / 1.35));
+  document.getElementById("fit").addEventListener("click", () => { fitSheet(); renderAtCurrentZoom(); });
+  document.getElementById("reset").addEventListener("click", () => { fitSheet(); renderAtCurrentZoom(); });
+  document.getElementById("download").addEventListener("click", () => {
+    const a = document.createElement("a"); a.href = PDF_URL; a.download = "arbol-pezuk.pdf"; a.click();
+  });
+
+  stage.addEventListener("wheel", e => {
+    e.preventDefault();
+    const rect = stage.getBoundingClientRect();
+    const px = e.clientX - rect.left, py = e.clientY - rect.top;
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    changeZoom(zoom * factor, px, py);
+  }, { passive: false });
+
+  stage.addEventListener("pointerdown", e => {
+    stage.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+    if (pointers.size === 1) {
+      stage.classList.add("dragging");
+      stage.dataset.dragX = e.clientX;
+      stage.dataset.dragY = e.clientY;
+      stage.dataset.originX = x;
+      stage.dataset.originY = y;
+    } else if (pointers.size === 2) {
+      const pts = [...pointers.values()];
+      lastPinchDistance = Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y);
+    }
+  });
+  stage.addEventListener("pointermove", e => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+    if (pointers.size === 1) {
+      x = Number(stage.dataset.originX) + (e.clientX - Number(stage.dataset.dragX));
+      y = Number(stage.dataset.originY) + (e.clientY - Number(stage.dataset.dragY));
+      updateView();
+    } else if (pointers.size === 2) {
+      const pts = [...pointers.values()];
+      const dist = Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y);
+      if (lastPinchDistance > 0 && dist > 0) {
+        const rect = stage.getBoundingClientRect();
+        const midX = (pts[0].x+pts[1].x)/2 - rect.left;
+        const midY = (pts[0].y+pts[1].y)/2 - rect.top;
+        zoomAt(zoom * dist / lastPinchDistance, midX, midY);
+        renderAtCurrentZoom();
+      }
+      lastPinchDistance = dist;
+    }
+  });
+  function endPointer(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) lastPinchDistance = 0;
+    if (!pointers.size) stage.classList.remove("dragging");
+    if (pointers.size === 1) {
+      const [id, p] = [...pointers.entries()][0];
+      stage.dataset.dragX = p.x; stage.dataset.dragY = p.y;
+      stage.dataset.originX = x; stage.dataset.originY = y;
+    }
+  }
+  stage.addEventListener("pointerup", endPointer);
+  stage.addEventListener("pointercancel", endPointer);
+  stage.addEventListener("lostpointercapture", endPointer);
+
+  let resizeTimer;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { fitSheet(); renderAtCurrentZoom(); }, 180);
+  });
+
+  pdfjsLib.getDocument({url: PDF_URL}).promise
+    .then(pdf => pdf.getPage(1))
+    .then(page => {
+      pdfPage = page;
+      const natural = page.getViewport({scale:1});
+      baseWidth = natural.width;
+      baseHeight = natural.height;
+      // Initial render uses a fit-to-window scale, then the same scale is shown to the user.
+      fitSheet();
+      loading.style.display = "none";
+      renderAtCurrentZoom();
+    })
+    .catch(err => showError((err && err.message) ? err.message : "Error desconocido."));
+})();
+</script>
+</body>
+</html>
